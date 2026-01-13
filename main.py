@@ -8,8 +8,10 @@ import autogen
 import html
 import json
 from datetime import datetime
+import re
 load_dotenv()
 import requests
+
 config_list = [{"model": "llama-3.3-70b-versatile", "api_key": os.getenv("GROQ_API_KEY"), "api_type": "groq"}]
 os.makedirs("output", exist_ok=True)
 os.makedirs("memory", exist_ok=True)
@@ -21,10 +23,15 @@ def wait_for_file(filepath, timeout=5):
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
             return True
         time.sleep(1)
-    return False  # <--- Change 'Fal' to 'False' here
-# Session Memory
+    return False
+
+
+# ============================================================================
+#                           ENHANCED SESSION MEMORY
+# ============================================================================
+
 class DiagramMemory:
-    """Manages conversation state and diagram history for iterative editing"""
+    """Manages conversation state with optimized context for LLMs"""
     
     def __init__(self, session_id=None):
         self.session_id = session_id or f"session_{int(time.time())}"
@@ -44,7 +51,7 @@ class DiagramMemory:
                 "iteration": 0,
                 "history": [],
                 "current_code": None,
-                "components": [],
+                "component_state": {},  # Track what exists currently
                 "base_filename": None,
                 "created_at": datetime.now().isoformat()
             }
@@ -54,8 +61,29 @@ class DiagramMemory:
         with open(self.memory_file, 'w') as f:
             json.dump(self.state, f, indent=2)
     
+    def extract_components(self, code, diagram_type):
+        """Extract component list from code for tracking"""
+        components = set()
+        
+        if diagram_type == "cloud":
+            # Extract Python Diagrams nodes
+            matches = re.findall(r'(\w+)\s*=\s*\w+\(', code)
+            components.update(matches)
+        
+        elif diagram_type == "mermaid":
+            # Extract Mermaid nodes
+            matches = re.findall(r'(\w+)[\[\(].*?[\]\)]', code)
+            components.update(matches)
+        
+        elif diagram_type == "d2":
+            # Extract D2 nodes
+            matches = re.findall(r'^(\w+):\s*', code, re.MULTILINE)
+            components.update(matches)
+        
+        return list(components)
+    
     def add_iteration(self, prompt, code, diagram_type, modifications=None):
-        """Add a new iteration to history"""
+        """Add iteration with component tracking"""
         if self.state["iteration"] >= self.max_iterations:
             raise Exception(f"Maximum iterations ({self.max_iterations}) reached. Start a new session.")
         
@@ -63,10 +91,14 @@ class DiagramMemory:
         self.state["diagram_type"] = diagram_type
         self.state["current_code"] = code
         
+        # Update component state
+        current_components = self.extract_components(code, diagram_type)
+        self.state["component_state"] = {comp: True for comp in current_components}
+        
         iteration_data = {
             "step": self.state["iteration"],
             "prompt": prompt,
-            "code": code,
+            "components": current_components,
             "modifications": modifications or [],
             "timestamp": datetime.now().isoformat()
         }
@@ -75,33 +107,87 @@ class DiagramMemory:
         self.save()
         return self.state["iteration"]
     
-    def get_context_for_llm(self):
-        """Generate context string for LLM about previous iterations"""
+    def get_compact_context(self):
+        """Generate token-efficient context for LLM"""
         if not self.state["history"]:
             return ""
         
-        # INCREASED from [-3:] to [-10:] to track all 10 steps
-        context = f"\n{'='*60}\nFULL SESSION HISTORY (Iteration {self.state['iteration']}/{self.max_iterations}):\n{'='*60}\n"
+        # Only send last 3 iterations to save tokens
+        recent_history = self.state["history"][-3:]
         
-        for hist in self.state["history"][-10:]:  
-            context += f"\nStep {hist['step']}: {hist['prompt']}"
-            if hist['modifications']:
-                context += f"\n  Action: {', '.join(hist['modifications'])}"
+        context = f"\n{'='*50}\nSESSION CONTEXT (Step {self.state['iteration']}/{self.max_iterations}):\n{'='*50}\n"
         
-        context += f"\n\nCRITICAL: The code below is the CURRENT state. DO NOT re-add items previously removed.\nCURRENT CODE:\n{self.state['current_code']}\n{'='*60}\n"
+        for hist in recent_history:
+            context += f"\nStep {hist['step']}: {hist['prompt'][:100]}"  # Truncate prompts
+            if hist.get('modifications'):
+                context += f"\n  Changes: {', '.join(hist['modifications'][:3])}"  # Limit mods
+        
+        # Show current components
+        if self.state["component_state"]:
+            active_components = [k for k, v in self.state["component_state"].items() if v]
+            context += f"\n\nCURRENT COMPONENTS: {', '.join(active_components)}"
+        
+        context += f"\n{'='*50}\n"
         return context
     
+    def get_editing_instructions(self, user_request):
+        """Generate specific editing instructions"""
+        instructions = f"\n{'='*50}\nEDITING INSTRUCTIONS:\n{'='*50}\n"
+        instructions += f"User Request: {user_request}\n\n"
+        
+        # Detect operation type
+        request_lower = user_request.lower()
+        
+        if any(word in request_lower for word in ["remove", "delete", "drop", "exclude"]):
+            # Extract what to remove
+            components_to_remove = self._extract_target_components(user_request)
+            instructions += f"OPERATION: REMOVE\n"
+            instructions += f"Target: {', '.join(components_to_remove)}\n"
+            instructions += f"Action: Delete ALL references to these components from the code\n"
+        
+        elif any(word in request_lower for word in ["add", "include", "insert"]):
+            instructions += f"OPERATION: ADD\n"
+            instructions += f"Action: Add new components while preserving existing ones\n"
+        
+        elif any(word in request_lower for word in ["replace", "change", "swap"]):
+            instructions += f"OPERATION: REPLACE\n"
+            instructions += f"Action: Replace specified component with new one\n"
+        
+        else:
+            instructions += f"OPERATION: MODIFY\n"
+            instructions += f"Action: Make the requested changes\n"
+        
+        instructions += f"\nCRITICAL: Base your edits on the CURRENT CODE shown below.\n"
+        instructions += f"{'='*50}\n"
+        return instructions
+    
+    def _extract_target_components(self, request):
+        """Extract component names from request"""
+        # Common cloud resources
+        patterns = [
+            r'(s3|rds|ec2|lambda|dynamo|vpc|elb|sns|sqs|cloudwatch)',
+            r'(\w+)\s+(?:bucket|instance|database|function|table)',
+        ]
+        
+        components = []
+        request_lower = request.lower()
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, request_lower)
+            components.extend(matches)
+        
+        return list(set(components))
+    
     def is_edit_request(self, prompt):
-        """Detect if this is an edit request vs new diagram"""
+        """Detect if this is an edit request"""
         edit_keywords = [
             "remove", "delete", "add", "modify", "change", "update", 
             "replace", "edit", "adjust", "move", "without", "exclude",
-            "include", "make it", "can you", "instead"
+            "include", "make it", "can you", "instead", "drop","remake","reorder","restructure","rebuild"
         ]
         
         prompt_lower = prompt.lower()
         
-        # If we have history and prompt contains edit keywords
         if self.state["history"] and any(kw in prompt_lower for kw in edit_keywords):
             return True
         
@@ -114,15 +200,32 @@ class DiagramMemory:
         self.state = self._load_or_create()
 
 
-# Global memory instance (will be set per session)
 current_memory = None
 
+def dot_to_png(dot_path: str, png_path: str):
+    """Converts DOT to PNG. Params: dot_path, png_path"""
+    try:
+        abs_dot = os.path.abspath(dot_path)
+        abs_png = os.path.abspath(png_path)
+        if not os.path.exists(abs_dot):
+            return f"Error: DOT file not found at {abs_dot}"
+        subprocess.run(["dot", "-Tpng", abs_dot, "-o", abs_png], check=True)
+        return f"SUCCESS: PNG created at {abs_png}"
+    except Exception as e:
+        return f"Error: {e}"
 
-#D2 Tool
+
+# ============================================================================
+#                           D2 TOOLS
+# ============================================================================
+
 def save_d2_code(d2_code: str, output_path: str):
     """Save D2 code to .d2 file"""
     try:
         clean_code = d2_code.strip().replace("```d2", "").replace("```", "")
+        if not output_path.endswith(".d2"):
+            output_path = output_path + ".d2"
+
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(clean_code)
         return f"SUCCESS: D2 code saved at {output_path}"
@@ -131,19 +234,18 @@ def save_d2_code(d2_code: str, output_path: str):
 
 
 def d2_to_png(d2_file_path: str, output_png: str):
-    """Convert D2 file to PNG using d2 CLI with safety check"""
+    """Convert D2 file to PNG"""
     try:
-        # Wait for the .d2 file to exist before compiling
         if not wait_for_file(d2_file_path):
             return f"Error: Source file {d2_file_path} was not found or is empty."
-            
         subprocess.run(["d2", d2_file_path, output_png], check=True)
         return f"SUCCESS: PNG created at {output_png}"
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def d2_to_svg(d2_file_path: str, output_svg: str):
-    """Convert D2 file to SVG (better for editing)"""
+    """Convert D2 file to SVG"""
     try:
         subprocess.run(["d2", d2_file_path, output_svg], check=True)
         return f"SUCCESS: SVG created at {output_svg}"
@@ -152,7 +254,7 @@ def d2_to_svg(d2_file_path: str, output_svg: str):
 
 
 def generate_terrastruct_link(d2_code: str):
-    """Generate Terrastruct Play link for editing D2 diagrams"""
+    """Generate Terrastruct Play link"""
     try:
         clean_code = d2_code.strip().replace("```d2", "").replace("```", "")
         encoded = base64.urlsafe_b64encode(clean_code.encode()).decode()
@@ -161,29 +263,25 @@ def generate_terrastruct_link(d2_code: str):
         return None
 
 
+# ============================================================================
+#                           DRAW.IO TOOLS
+# ============================================================================
 
-
-
-
-
-# -------- TOOL: DOT → DRAW.IO XML --------
 def export_to_drawio(dot_file_path: str):
-    """Convert DOT to Draw.io XML with retry logic to wait for file creation"""
+    """Convert DOT to Draw.io XML"""
     try:
         abs_path = os.path.abspath(dot_file_path)
         output_xml = abs_path.replace(".dot", ".xml")
         
-        # Adding a small sleep to ensure OS has finished writing the file
         max_retries = 10
         for i in range(max_retries):
             if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
                 break
             time.sleep(1)
         else:
-            return f"Error: File {dot_file_path} not found or empty after waiting. Ensure the Diagram code executed correctly."
+            return f"Error: File {dot_file_path} not found or empty after waiting."
 
         venv_python = sys.executable 
-        # Use -m to ensure it uses the library installed in your venv
         result = subprocess.run([venv_python, "-m", "graphviz2drawio", abs_path, "-o", output_xml], 
                                 capture_output=True, text=True)
         
@@ -193,16 +291,31 @@ def export_to_drawio(dot_file_path: str):
         return f"SUCCESS: XML created at {output_xml}"
     except Exception as e:
         return f"Error: {str(e)}"
-        
-# -------- TOOL: Mermaid → DRAW.IO XML --------
-def export_mermaid_to_drawio(mermaid_code: str, output_path: str):
+
+def run_diagram_py(py_file_path: str):
+    """Execute a diagrams python file to generate .dot"""
     try:
-        # 1. Clean code and remove problematic newlines for the XML attribute
+        result = subprocess.run(
+            [sys.executable, py_file_path],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            return f"Execution failed: {result.stderr}"
+        return "SUCCESS: Diagram script executed"
+    except Exception as e:
+        return f"Error executing diagram: {e}"
+
+# ============================================================================
+#                           MERMAID TOOLS
+# ============================================================================
+
+def export_mermaid_to_drawio(mermaid_code: str, output_path: str):
+    """Convert Mermaid to Draw.io XML"""
+    try:
         clean_code = mermaid_code.strip().replace("```mermaid", "").replace("```", "")
-        # Replace actual newlines with XML entity representation to prevent tool failures
         escaped_code = html.escape(clean_code).replace('\n', '&#xa;')
         
-        # 2. Use the 'shape=mxgraph.mermaid.mermaid' style which draw.io recognizes
         xml_content = f"""<mxfile host="app.diagrams.net">
   <diagram id="mermaid-1" name="Page-1">
     <mxGraphModel>
@@ -225,24 +338,16 @@ def export_mermaid_to_drawio(mermaid_code: str, output_path: str):
 
 
 def mermaid_to_png(mermaid_code: str, output_path: str):
-    """
-    Convert Mermaid code to PNG using web service.
-    """
-    import base64
-    import requests
+    """Convert Mermaid to PNG"""
     try:
-        # 1. Aggressively clean the code
         clean_code = mermaid_code.strip().replace("```mermaid", "").replace("```", "")
         
-        # 2. Fix ER Diagram headers if buried
         if "erDiagram" in clean_code and not clean_code.startswith("erDiagram"):
             clean_code = "erDiagram" + clean_code.split("erDiagram")[-1]
         
-        # 3. Add default header if missing entirely
         elif not any(k in clean_code for k in ["graph", "flowchart", "sequenceDiagram", "erDiagram", "classDiagram"]):
             clean_code = f"graph TD\n{clean_code}"
 
-        # 4. Encoding for the web service
         encoded_string = base64.b64encode(clean_code.encode('utf-8')).decode('utf-8')
         url = f"https://mermaid.ink/img/{encoded_string}"
         
@@ -258,7 +363,7 @@ def mermaid_to_png(mermaid_code: str, output_path: str):
 
 
 def save_mermaid_code(mermaid_code: str, output_path: str):
-    """Save Mermaid code to .mmd file"""
+    """Save Mermaid code"""
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(mermaid_code)
@@ -266,270 +371,225 @@ def save_mermaid_code(mermaid_code: str, output_path: str):
     except Exception as e:
         return f"Error saving Mermaid code: {e}"
 
+def save_cloud_code(code: str, path: str):
+    """Saves cloud diagram python code. Params: code, path"""
+    try:
+        if not path.endswith(".py"): path += ".py"
+        clean_code = code.strip().replace("```python", "").replace("```", "")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(clean_code)
+        return f"SUCCESS: Python code saved at {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
 
+# ============================================================================
+#                           AGENT SETUP (OPTIMIZED)
+# ============================================================================
 
-# -------- Cloud Architect AGENT SETUP --------
 cloud_architect = autogen.AssistantAgent(
     name="Architect",
-    llm_config={"config_list": config_list},
-    system_message="""You are a Senior Cloud Architect. 
-    
-    IMPORT RULES:
-    - AWS Cloudwatch is: from diagrams.aws.management import Cloudwatch (lowercase 'w').
-    - Always use: from diagrams import Diagram, Edge, Cluster.
-    
-    STRICT OPERATIONAL RULES:
-    1. Provide your Python code in a block. You MUST use 'output/{unique_name}' for the filename.
-    2. STOP and wait for the User_Proxy to execute the code and return 'exitcode: 0'.
-    3. ONLY AFTER exitcode 0, call 'export_to_drawio(dot_file_path="output/{unique_name}.dot")'.
-    4. NEVER call the tool in the same message as the code.
+    llm_config={"config_list": config_list, "timeout": 120},
+    system_message="""
+You are a Cloud Architecture expert. You follow a strict "Step-by-Step" execution protocol.
 
-    MEMORY RULES:
-    - Use the 'CURRENT CODE' as the only source of truth.
-    - If a component was removed in a previous step, it MUST NOT appear in your new code.
-    - Build your new code by modifying the 'CURRENT CODE' directly.
-    
-    ITERATIVE MEMORY RULES:
-    - Modify the 'CURRENT CODE' provided in the context.
-    - If a user asked to remove a component in a previous step, DO NOT add it back.
-    - Example-If you are removing 's3', delete all references to 'S3' and its edges from the code.
+CRITICAL FILENAME RULE (MANDATORY):
+You MUST set the 'filename' parameter in Diagram() to the exact ID provided (e.g., "output/diagram_123").
+Example: with Diagram("Title", filename="output/diagram_123", outformat="dot", show=False):
 
-    WORKFLOW:
-    Step 1: Write and EXECUTE the Python code.
-    Step 2: Wait for exitcode 0.
-    Step 3: Call export_to_drawio(dot_file_path='output/{unique_name}.dot').
-    Step 4: Say TERMINATE."""
+CRITICAL SYNTAX RULES:
+1. NO CLUSTER CONNECTIONS: You CANNOT connect a Cluster object to another node (e.g., 'public_subnet >> ec2' is ILLEGAL). You must connect nodes to nodes (e.g., 'lb >> ec2_public').
+2. NO 'Subnet' CLASS: Use 'with Cluster("Subnet Name"):'.
+3. FILENAME: Use Diagram(..., filename="output/diagram_123", outformat="dot").
+
+CRITICAL TOOL FORMATTING:
+- You MUST use standard JSON tool calls. 
+- NEVER use <function=...> tags.
+- Use EXACT argument names: 'code' and 'path' for save_cloud_code.
+
+
+LIBRARY SYNTAX RULES (NO EXCEPTIONS):
+1. PLURAL IMPORTS: Use 'from diagrams import Diagram, Cluster, Edge'.
+2. NO 'Subnet' CLASS: 'diagrams.aws.network' does NOT have a 'Subnet' class. You MUST use 'Cluster' to represent subnets.
+3. GLOBAL CONTEXT: Every resource (VPC, EC2, RDS, etc.) MUST be instantiated INSIDE the 'with Diagram(...):' block.
+4. PROVIDER MAPPING:
+   - AWS: from diagrams.aws.[category] import [Resource]
+   - Azure: from diagrams.azure.[category] import [Resource]
+   - GCP: from diagrams.gcp.[category] import [Resource]
+
+STRICT TOOL CHAIN (LINEAR ONLY):
+STRICT TOOL CALLING:
+When calling dot_to_png, use exactly these arguments:
+dot_to_png(dot_path="output/diagram_123.dot", png_path="output/diagram_123.png")
+You are FORBIDDEN from calling multiple tools at once. You must wait for "SUCCESS" before suggesting the next tool.
+Step 1: Call 'save_cloud_code'. (Stop and wait for SUCCESS).
+Step 2: Call 'run_diagram_py'. (Stop and wait for SUCCESS).
+Step 3: Call 'dot_to_png'. (Stop and wait for SUCCESS).
+Step 4: Call 'export_to_drawio'. (Stop and wait for SUCCESS).
+Step 5: Type 'TERMINATE'.
+
+IF 'run_diagram_py' FAILS:
+Analyze the Traceback. If it says 'ImportError: cannot import name Subnet', rewrite the code using 'Cluster' for subnets, call 'save_cloud_code' again, and restart the chain.
+
+EDITING MODE:
+If "CURRENT CODE" is provided, modify ONLY the specific components requested. If removing a node, you MUST delete every line where that node's variable appears, including connection lines (>> or <<).
+"""
 )
 
-# -------- Mermaid Architect AGENT SETUP --------
 mermaid_architect = autogen.AssistantAgent(
     name="MermaidArchitect",
-    llm_config={"config_list": config_list},
-    system_message=
-    """You are a Business Process expert with iterative editing capabilities.
-    ITERATIVE EDITING MODE:
-    When you receive CONVERSATION CONTEXT:
-    1. Analyze the CURRENT CODE (Mermaid syntax)
-    2. Parse the modification request
-    3. Edit the diagram code:
-    - Remove: Delete nodes and their connections
-    - Add: Insert new nodes with proper syntax
-    - Modify: Update labels, styles, or relationships
-    4. Preserve diagram type and overall flow
+    llm_config={"config_list": config_list, "timeout": 120},
+    system_message="""You are a Mermaid diagram expert with surgical editing precision.
 
-    SUPPORTED TYPES: flowchart, sequenceDiagram, classDiagram, erDiagram, stateDiagram-v2, gantt, pie, journey
+EDITING MODE:
+1. Start with the "CURRENT CODE" provided
+2. Apply ONLY the requested change
+3. Preserve all other elements
+4. Track removals: if something is deleted, keep it deleted
 
-    WORKFLOW:
-    1. Generate/Edit Mermaid code
-    2. Call 'save_mermaid_code' → wait for SUCCESS
-    3. Call 'mermaid_to_png' → wait for SUCCESS
-    4. Call 'export_mermaid_to_drawio' → wait for SUCCESS
-    5. Mention changes made, then 'TERMINATE'
+TYPES: flowchart, sequenceDiagram, classDiagram, erDiagram, stateDiagram-v2, gantt, pie
 
-    CRITICAL: 
-    - No markdown backticks in tool parameters
-    - Execute tools sequentially
-    - Track modifications
-    """
+EDITING OPERATIONS:
+- REMOVE: Delete node and its connections
+- ADD: Insert new node with proper syntax
+- MODIFY: Update labels or relationships
+
+WORKFLOW:
+1. Generate/Edit code
+2. Call save_mermaid_code → wait for SUCCESS
+3. Call mermaid_to_png → wait for SUCCESS  
+4. Call export_mermaid_to_drawio → wait for SUCCESS
+5. List changes made, then TERMINATE
+
+NO markdown backticks in tool parameters!"""
 )
 
-#D2 Architect AGENT SETUP
 d2_architect = autogen.AssistantAgent(
     name="D2Architect",
-    llm_config={"config_list": config_list},
-    system_message="""You are a D2 Diagramming expert specializing in declarative diagrams.
+    llm_config={"config_list": config_list, "timeout": 120},
+    system_message="""You are a D2 diagram expert with precise editing capabilities.
 
-D2 is a modern diagram scripting language. You can create:
-- System architectures
-- Network diagrams
-- Database schemas
-- Sequence diagrams
-- Component relationships
-
-D2 SYNTAX BASICS:
+D2 SYNTAX:
 - Nodes: server: "Web Server"
 - Connections: client -> server: "HTTPS"
 - Containers: aws: { ec2; s3; rds }
 - Styling: server.style.fill: "#ff0000"
 
-ITERATIVE EDITING MODE:
-When you receive CONVERSATION CONTEXT:
-1. Analyze the CURRENT CODE (D2 syntax)
-2. Parse modifications
-3. Edit intelligently:
-   - Remove: Delete node definitions and connections
-   - Add: Insert new nodes with proper D2 syntax
-   - Modify: Update labels, styles, or connections
-4. Maintain structure and relationships
+EDITING MODE:
+1. Use "CURRENT CODE" as base
+2. Apply requested changes only
+3. Maintain structure and relationships
+4. Remove means DELETE completely
 
 WORKFLOW:
 1. Generate/Edit D2 code
-2. Call 'save_d2_code' → wait for SUCCESS
-3. Call 'd2_to_png' → wait for SUCCESS
-4. Call 'd2_to_svg' → wait for SUCCESS
-5. List changes, mention Terrastruct link for editing, then 'TERMINATE'
+2. Call save_d2_code → wait
+3. Call d2_to_png → wait
+4. Call d2_to_svg → wait
+5. Mention Terrastruct link, then TERMINATE
 
-CRITICAL:
-- Use clean D2 syntax (no markdown backticks in tool calls)
-- Execute tools sequentially
-- D2 diagrams are edited at: https://play.terrastruct.com/
-"""
+Clean D2 syntax only - no markdown backticks in tools!"""
 )
-
-
-
-
-
-
 
 user_proxy = autogen.UserProxyAgent(
     name="User_Proxy",
     human_input_mode="NEVER",
-    max_consecutive_auto_reply=15, # Increased to allow for debugging loops
+    max_consecutive_auto_reply=10,
     is_termination_msg=lambda x: "TERMINATE" in (x.get("content") or ""),
     code_execution_config={"work_dir": ".", "use_docker": False},
 )
 
-
-
-# Cloud Architect tool registration
+# Tool registrations
 autogen.agentchat.register_function(
-    f=export_to_drawio,
+    f=export_to_drawio, caller=cloud_architect, executor=user_proxy,
+    name="export_to_drawio", description="Converts dot to XML"
+)
+
+autogen.agentchat.register_function(
+    f=save_mermaid_code, caller=mermaid_architect, executor=user_proxy,
+    name="save_mermaid_code", description="Saves Mermaid code"
+)
+
+autogen.agentchat.register_function(
+    f=mermaid_to_png, caller=mermaid_architect, executor=user_proxy,
+    name="mermaid_to_png", description="Converts Mermaid to PNG"
+)
+
+autogen.agentchat.register_function(
+    f=export_mermaid_to_drawio, caller=mermaid_architect, executor=user_proxy,
+    name="export_mermaid_to_drawio", description="Converts Mermaid to Draw.io XML"
+)
+
+autogen.agentchat.register_function(
+    f=save_d2_code, caller=d2_architect, executor=user_proxy,
+    name="save_d2_code", description="Saves D2 code"
+)
+
+autogen.agentchat.register_function(
+    f=d2_to_png, caller=d2_architect, executor=user_proxy,
+    name="d2_to_png", description="Converts D2 to PNG"
+)
+
+autogen.agentchat.register_function(
+    f=d2_to_svg, caller=d2_architect, executor=user_proxy,
+    name="d2_to_svg", description="Converts D2 to SVG"
+)
+autogen.agentchat.register_function(
+    f=run_diagram_py,
     caller=cloud_architect,
     executor=user_proxy,
-    name="export_to_drawio",
-    description="Converts dot to XML"
+    name="run_diagram_py",
+    description="Executes diagram python file to generate DOT"
 )
-
-# Mermaid Architect tool registration
 autogen.agentchat.register_function(
-    f=save_mermaid_code,
-    caller=mermaid_architect,
+    f=save_cloud_code,
+    caller=cloud_architect,
     executor=user_proxy,
-    name="save_mermaid_code",
-    description="Saves Mermaid diagram code to .mmd file"
+    name="save_cloud_code",
+    description="Saves code to a path. Args: code (str), path (str)"
 )
-
 autogen.agentchat.register_function(
-    f=mermaid_to_png,
-    caller=mermaid_architect,
+    f=dot_to_png,
+    caller=cloud_architect,
     executor=user_proxy,
-    name="mermaid_to_png",
-    description="Converts Mermaid code to PNG image"
+    name="dot_to_png",
+    description="Converts DOT to PNG. Args: dot_path (str), png_path (str)"
 )
 
-autogen.agentchat.register_function(
-    f=export_mermaid_to_drawio,
-    caller=mermaid_architect,
-    executor=user_proxy,
-    name="export_mermaid_to_drawio",
-    description="Converts Mermaid code to Draw.io XML format"
-)
-
-# D2 Architect tools
-autogen.agentchat.register_function(
-    f=save_d2_code,
-    caller=d2_architect,
-    executor=user_proxy,
-    name="save_d2_code",
-    description="Saves D2 code to .d2 file"
-)
-
-autogen.agentchat.register_function(
-    f=d2_to_png,
-    caller=d2_architect,
-    executor=user_proxy,
-    name="d2_to_png",
-    description="Converts D2 to PNG using CLI"
-)
-
-autogen.agentchat.register_function(
-    f=d2_to_svg,
-    caller=d2_architect,
-    executor=user_proxy,
-    name="d2_to_svg",
-    description="Converts D2 to SVG for editing"
-)
-
-
+# ============================================================================
+#                           DIAGRAM TYPE DETECTION
+# ============================================================================
 
 def detect_diagram_type(prompt: str) -> str:
-    """
-    Detect what type of diagram the user wants based on keywords
-    
-    Returns: "cloud" or "mermaid"
-    """
+    """Detect diagram type from prompt"""
     prompt_lower = prompt.lower()
     
-    #d2 keywords
-    d2_keywords = [
-        "d2", "modern diagram", "declarative", "system architecture",
-        "component diagram", "clean diagram"
-    ]
-
-
-    # Cloud architecture keywords
-    cloud_keywords = [
-        "aws", "azure", "gcp", "cloud", "infrastructure", "ec2", "s3", "rds",
-        "lambda", "vpc", "load balancer", "kubernetes", "k8s", "docker",
-        "terraform", "cloudformation", "iac"
-    ]
+    d2_keywords = ["d2", "modern diagram", "declarative", "system architecture"]
+    cloud_keywords = ["aws", "azure", "gcp", "cloud", "ec2", "s3", "rds", "lambda", "vpc","vnet","cosmos","lambda","bigquery"]
+    mermaid_keywords = ["flowchart", "sequence", "er diagram", "class diagram", "process"]
     
-    # Mermaid diagram keywords
-    mermaid_keywords = [
-        "flowchart", "flow chart", "process", "workflow", "sequence",
-        "class diagram", "er diagram", "database schema", "state diagram",
-        "gantt", "timeline", "project plan", "user journey", "api flow",
-        "business process", "decision tree", "oop", "uml"
-    ]
+    d2_score = sum(1 for kw in d2_keywords if kw in prompt_lower)
+    cloud_score = sum(1 for kw in cloud_keywords if kw in prompt_lower)
+    mermaid_score = sum(1 for kw in mermaid_keywords if kw in prompt_lower)
     
-    # Check for d2 keywords first
-    d2_score = sum(1 for keyword in d2_keywords if keyword in prompt_lower)
-
-    # Check for cloud keywords
-    cloud_score = sum(1 for keyword in cloud_keywords if keyword in prompt_lower)
-    
-    # Check for mermaid keywords
-    mermaid_score = sum(1 for keyword in mermaid_keywords if keyword in prompt_lower)
-    
-    # Decide
-    scores = [
-        (d2_score, "d2"),
-        (cloud_score, "cloud"),
-        (mermaid_score, "mermaid")
-    ]
-    
+    scores = [(d2_score, "d2"), (cloud_score, "cloud"), (mermaid_score, "mermaid")]
     max_score, diagram_type = max(scores, key=lambda x: x[0])
     
-    # Default logic
     if max_score == 0:
-        if prompt.endswith('.tf'):
-            return "cloud"
-        return "mermaid"  # Default
+        return "cloud" if prompt.endswith('.tf') else "mermaid"
     
     return diagram_type
-    
 
 
+# ============================================================================
+#                           MAIN GENERATION ENGINE
+# ============================================================================
 
-
-# -------- MAIN GENERATION ENGINE --------
 def generate_diagram(prompt_input, session_id=None, is_continuation=False):
-    """
-    Main generation function with memory support
-    
-    Args:
-        prompt_input: Text prompt or file path
-        session_id: Optional session ID for continuing conversations
-        is_continuation: Whether this is an edit request
-    
-    Returns:
-        dict with: unique_name, session_id, iteration, diagram_type, terrastruct_link
-    """
+    """Main generation with optimized memory"""
     global current_memory
     
-    # Initialize or load memory
+    # Initialize memory
     if session_id and os.path.exists(f"memory/{session_id}.json"):
         current_memory = DiagramMemory(session_id)
     else:
@@ -545,12 +605,7 @@ def generate_diagram(prompt_input, session_id=None, is_continuation=False):
     else:
         final_prompt = prompt_input
         is_edit = current_memory.is_edit_request(prompt_input)
-        
-        # Determine diagram type
-        if is_edit:
-            diagram_type = current_memory.state["diagram_type"]
-        else:
-            diagram_type = detect_diagram_type(prompt_input)
+        diagram_type = current_memory.state["diagram_type"] if is_edit else detect_diagram_type(prompt_input)
     
     # Generate filename
     if current_memory.state["base_filename"]:
@@ -560,66 +615,79 @@ def generate_diagram(prompt_input, session_id=None, is_continuation=False):
         unique_name = f"diagram_{timestamp}"
         current_memory.state["base_filename"] = unique_name
     
-    # Build message with context for LLM
-    context = current_memory.get_context_for_llm() if is_edit else ""
-    
+    # Build optimized message
     if is_edit:
-        llm_message = f"""{context}
+        compact_context = current_memory.get_compact_context()
+        editing_instructions = current_memory.get_editing_instructions(final_prompt)
+        
+        llm_message = f"""{compact_context}
 
-USER REQUEST: {final_prompt}
+{editing_instructions}
 
-STRICT TASK:
-1. Modify the 'CURRENT CODE' provided in the context.
-2. If the user asks to remove something, ensure it stays gone.
-3. DO NOT revert to any previous version of the code or re-add components if they where removed .
-4. Apply ONLY the new change: {final_prompt}
-5. Use the same filename: output/{unique_name}
-"""
+CURRENT CODE (Your starting point):
+```
+{current_memory.state['current_code']}
+```
+
+TASK: Edit the above code to apply: {final_prompt}
+Save as: output/{unique_name}
+
+CRITICAL RULES:
+1. Start from the CURRENT CODE above
+2. Apply ONLY the requested change
+3. If removing, delete completely
+4. Do NOT regenerate from scratch"""
     else:
-        llm_message = f"Request: {final_prompt}. Save as 'output/{unique_name}'"
+        llm_message = f"Create: {final_prompt}\nFilename: output/{unique_name}"
     
-    # Route to appropriate agent
+    # Log
     print(f"\n{'='*60}")
-    print(f"Diagram Type: {diagram_type.upper()}")
-    print(f"Mode: {'EDIT' if is_edit else 'NEW'}")
+    print(f"Type: {diagram_type.upper()} | Mode: {'EDIT' if is_edit else 'NEW'}")
     print(f"Iteration: {current_memory.state['iteration'] + 1}/{current_memory.max_iterations}")
-    print(f"Session ID: {current_memory.session_id}")
     print(f"{'='*60}\n")
     
     terrastruct_link = None
     
     try:
+        # Route to agent
         if diagram_type == "cloud":
             user_proxy.initiate_chat(cloud_architect, message=llm_message)
-            
         elif diagram_type == "mermaid":
             user_proxy.initiate_chat(mermaid_architect, message=llm_message)
-            
         elif diagram_type == "d2":
             user_proxy.initiate_chat(d2_architect, message=llm_message)
-            
-            # Generate Terrastruct link if D2 code exists
             d2_file = f"output/{unique_name}.d2"
             if os.path.exists(d2_file):
                 with open(d2_file, 'r') as f:
-                    d2_code = f.read()
-                terrastruct_link = generate_terrastruct_link(d2_code)
+                    terrastruct_link = generate_terrastruct_link(f.read())
         
-        time.sleep(5)  # Allow time for file writes
-        # Extract code from last generated file
-        generated_code = None
-        for ext in ['.py', '.mmd', '.d2']:
-            code_file = f"output/{unique_name}{ext}"
+        dot_file = f"output/{unique_name}.dot"
+        wait_for_file(dot_file, timeout=10)
+        
+        # Extract generated code
+        generated_code = ""
+        possible_files = [
+            f"output/{unique_name}.py", 
+            "diagram.py", 
+            f"output/{unique_name}.mmd", 
+            f"output/{unique_name}.d2"
+        ]
+        for code_file in possible_files:
             if os.path.exists(code_file):
-                with open(code_file, 'r') as f:
+                with open(code_file, 'r', encoding='utf-8') as f:
                     generated_code = f.read()
                 break
         
-        # Update memory
-        modifications = ["Initial creation"] if not is_edit else [f"Modified based on: {final_prompt}"]
+        # Fallback to prevent NoneType error
+        if not generated_code:
+            generated_code = "# Code captured from memory\n" + (current_memory.state.get('current_code') or "")
+
+        modifications = ["Intial creation"] if not is_edit else [f"Applied: {final_prompt}"]
+
+        # Update memory with valid string
         current_memory.add_iteration(
             prompt=final_prompt,
-            code=generated_code or "Code not captured",
+            code=generated_code,
             diagram_type=diagram_type,
             modifications=modifications
         )
@@ -639,17 +707,21 @@ STRICT TASK:
 
 
 def reset_session(session_id):
-    """Clear a specific session's memory"""
+    """Clear session memory"""
     memory = DiagramMemory(session_id)
     memory.reset()
-    print(f"Session {session_id} has been reset.")
-
-
-
-
-
-
+    print(f"Session {session_id} reset.")
 
 
 if __name__ == "__main__":
-    generate_diagram("Create an ER diagram for loan approval system with Customers, Loans, Payments.")  # Test run
+    # Test
+    result1 = generate_diagram("draw a AWS complex architecture with VPC, public and private subnets, EC2 instances, RDS database, S3 bucket, and load balancer.")
+    print(f"\nSession ID: {result1['session_id']}")
+    
+    # Test edit
+   # result2 = generate_diagram(
+       # "Remove S3 bucket", 
+        #session_id=result1['session_id'], 
+        #is_continuation=True
+    #)
+    #print(f"\nEdit completed: Iteration {result2['iteration']}")

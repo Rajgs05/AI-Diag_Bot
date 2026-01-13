@@ -192,8 +192,18 @@ if st.button(button_text, type=button_type, use_container_width=True):
                     xml_path = f"output/{unique_name}.xml"
                     svg_path = f"output/{unique_name}.svg"
                     
-                    time.sleep(2)  # File sync
+                    time.sleep(5)  # File sync
                     
+                    abs_xml_path = os.path.abspath(f"output/{unique_name}.xml")
+                    abs_png_path =  os.path.abspath(f"output/{unique_name}.png")
+
+
+                    if os.path.exists(abs_xml_path):
+                        with open(abs_xml_path, "r", encoding="utf-8") as f:
+                            xml_data = f.read()
+                    # ... rest of your Draw.io button code
+                    else:
+                        st.warning("Draw.io file is still being processed. Please wait 2 seconds and click 'Generate' again to refresh.")
                     # ============================================================================
                     #                           RESULTS DISPLAY
                     # ============================================================================

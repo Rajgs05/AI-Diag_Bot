@@ -652,4 +652,4 @@ def reset_session(session_id):
 
 
 if __name__ == "__main__":
-    generate_diagram("Create an ER diagram for loan approval system with Customers, Loans, Payments.")  # Test run
+    generate_diagram("draw a azure complex architecture for how database of azure is designed.")  # Test run
